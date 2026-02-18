@@ -1,0 +1,178 @@
+name: DolanSecOps CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - name: Install Python dependencies
+        run: |
+          pip install -r apps/api/requirements.txt
+          pip install flake8 pytest
+      - name: Lint Python code
+        run: flake8 apps/api apps/ai_engine apps/graph_engine apps/runtime_agent
+
+  lint-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: |
+          cd apps/frontend
+          npm install
+      - name: Run ESLint
+        run: npm run lint
+
+  test-python:
+    runs-on: ubuntu-latest
+    needs: lint-python
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - name: Install dependencies
+        run: |
+          pip install -r apps/api/requirements.txt
+          pip install pytest
+      - name: Run tests
+        run: pytest apps/api/tests --maxfail=1 --disable-warnings -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [lint-python, lint-frontend, test-python]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Log in to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build API image
+        run: docker build -t dolansecops/api:latest ./apps/api
+      - name: Build AI Engine image
+        run: docker build -t dolansecops/ai_engine:latest ./apps/ai_engine
+      - name: Build Graph Engine image
+        run: docker build -t dolansecops/graph_engine:latest ./apps/graph_engine
+      - name: Build Frontend image
+        run: docker build -t dolansecops/frontend:latest ./apps/frontend
+      - name: Push images
+        run: |
+          docker push dolansecops/api:latest
+          docker push dolansecops/ai_engine:latest
+          docker push dolansecops/graph_engine:latest
+          docker push dolansecops/frontend:latest
+      
+  deploy:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: v1.28.0
+      - name: Set Kubeconfig
+        run: echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install dolansecops ./charts/dolansecops \
+            --namespace dolansecops-dev \
+            --set image.api.tag=latest \
+            --set image.ai_engine.tag=latest \
+            --set image.graph_engine.tag=latest \
+            --set image.frontend.tag=latest
+
+  # Static Analysis: CodeQL + Semgrep
+  sast:
+    runs-on: ubuntu-latest
+    needs: test-python
+    steps:
+      - uses: actions/checkout@v3
+      # CodeQL
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: python, javascript
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+
+      # Semgrep
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: "p/ci"
+          output: semgrep_report.json
+
+  # Dynamic Analysis: OWASP ZAP
+  dast:
+    runs-on: ubuntu-latest
+    needs: test-python
+    steps:
+      - uses: actions/checkout@v3
+      - name: Start API service for ZAP
+        run: docker-compose up -d api frontend
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.6.0
+        with:
+          target: "http://localhost:8000"
+          format: "json"
+          output: "scans/zap_reports/zap_report.json"
+      - name: Stop Docker Compose
+        run: docker-compose down
+  test-coverage:
+    runs-on: ubuntu-latest
+    needs: test-python
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - name: Install dependencies
+        run: |
+          pip install -r apps/api/requirements.txt
+          pip install pytest pytest-cov
+      - name: Run tests with coverage
+        run: |
+          pytest apps/api/tests --cov=apps/api --cov=apps/ai_engine --cov-report xml
+      - name: Upload coverage to SonarQube
+        uses: sonarsource/sonarcloud-github-action@v2
+        with:
+          args: >
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+  infra-scan:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - name: Install dependencies
+        run: pip install checkov trivy
+      - name: Run IaC scans
+        run: |
+          checkov -d ./infra/terraform -o json > scans/checkov.json
+          trivy fs ./infra/container_images -f json -o scans/trivy.json
+      - name: Upload scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: infra-scan-reports
+          path: scans/
